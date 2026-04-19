@@ -222,14 +222,14 @@
   <div id="testIntro" class="form-card">
     <div class="form-title">Screening Assessment</div>
     <div class="form-sub">20 AI-generated questions based on your skills &amp; interests</div>
-    <div class="alert alert-info">Ollama generates questions locally. Score ≥ 15 → Advanced roadmap &nbsp;|&nbsp; Score &lt; 15 → Basic roadmap</div>
+    <div class="alert alert-info">Groq AI generates questions in the cloud. Score ≥ 15 → Advanced roadmap &nbsp;|&nbsp; Score &lt; 15 → Basic roadmap</div>
     <br/>
     <button class="btn btn-primary" onclick="startScreening()">Generate &amp; Start Test →</button>
   </div>
   <div id="testLoading" style="display:none" class="form-card">
     <div class="ai-loading">
       <div class="pulse-ring"></div>
-      <div style="font-size:1rem;font-weight:600">Ollama is generating your questions…</div>
+      <div style="font-size:1rem;font-weight:600">Groq AI is generating your questions…</div>
       <div style="font-size:0.82rem;color:var(--muted)" id="loadTxt">Analysing your profile</div>
     </div>
   </div>
@@ -263,11 +263,11 @@
 <div class="main"><div class="container">
   <div class="form-card">
     <div class="form-title" id="rmTitle">Your Learning Roadmap</div>
-    <div class="form-sub" id="rmSub">AI-generated roadmap via Ollama</div>
+    <div id="rmSub" class="form-sub">AI-generated roadmap via Groq</div>
     <div id="rmLoading" class="ai-loading">
       <div class="pulse-ring"></div>
       <div style="font-size:1rem;font-weight:600">Building your roadmap…</div>
-      <div style="font-size:0.82rem;color:var(--muted)">Ollama is crafting your weekly plan</div>
+      <div style="font-size:0.82rem;color:var(--muted)">Groq AI is crafting your weekly plan</div>
     </div>
     <div id="rmContent" style="display:none">
       <div class="roadmap-tabs">
@@ -293,7 +293,7 @@
     <div class="stat-grid">
       <div class="stat-card"><div class="stat-value" style="color:var(--accent)">50</div><div class="stat-key">Questions</div></div>
       <div class="stat-card"><div class="stat-value" style="color:var(--green)">~45 min</div><div class="stat-key">Duration</div></div>
-      <div class="stat-card"><div class="stat-value" style="color:var(--accent2)">Ollama</div><div class="stat-key">Powered</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:var(--accent2)">Groq</div><div class="stat-key">Powered</div></div>
     </div>
     <button class="btn btn-primary" onclick="startProgress()">Generate &amp; Start →</button>
   </div>
@@ -329,8 +329,8 @@
 <div class="main"><div class="container">
   <div class="form-card">
     <div class="form-title">AI Resume Generator</div>
-    <div class="form-sub">Professional resume built by Ollama from your profile &amp; roadmap</div>
-    <div id="resumeLoading" class="ai-loading"><div class="pulse-ring"></div><div style="font-size:0.85rem;color:var(--muted)">Ollama is writing your resume…</div></div>
+    <div class="form-sub">Professional resume built by Groq AI from your profile &amp; roadmap</div>
+    <div id="resumeLoading" class="ai-loading"><div class="pulse-ring"></div><div style="font-size:0.85rem;color:var(--muted)">Groq AI is writing your resume…</div></div>
     <div id="resumeOut" style="display:none"></div>
   </div>
   <div id="resumeActions" style="display:none" class="flex-gap">
@@ -448,7 +448,7 @@ function renderQ() {
   document.getElementById('qScore').textContent = `Score: ${S.sScore}`;
   document.getElementById('qTag').textContent = q.tag || 'General';
   document.getElementById('qText').textContent = q.q;
-  document.getElementById('qProg').style.width = `${((S.sCurrent+1)/S.sQs.length)*100}%`;
+  document.getElementById('qProg').style.width = `${((S.sCurrent + 1) / S.sQs.length) * 100}%`;
   document.getElementById('qNext').style.display = 'none';
   document.getElementById('qExpl').style.display = 'none';
   const grid = document.getElementById('qOpts'); grid.innerHTML = '';
