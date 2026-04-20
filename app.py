@@ -1,13 +1,18 @@
 """
-CareerPath AI — Flask Backend with Groq API Integration
---------------------------------------------------------
-Groq is FREE and requires no local RAM for AI.
-Get your free API key at: https://console.groq.com
+CareerPath AI — Flask Backend with Multi-Provider AI Fallback
+-------------------------------------------------------------
+Supports Groq, Google Gemini, and OpenRouter with automatic
+fallback when rate limits are hit. All providers are FREE.
+
+Get free API keys:
+  Groq:       https://console.groq.com
+  Gemini:     https://aistudio.google.com/apikey
+  OpenRouter: https://openrouter.ai/keys
 """
 
 from flask import Flask, request, jsonify, render_template, session
 from flask_cors import CORS
-import sqlite3, hashlib, os, json, requests, re
+import sqlite3, hashlib, os, json, requests, re, time
 from datetime import datetime
 from functools import wraps
 
@@ -16,9 +21,19 @@ app.secret_key = os.environ.get("SECRET_KEY", "careerpath-dev-secret-2024")
 CORS(app, supports_credentials=True)
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")   # paste your key here or set env var
-GROQ_MODEL = "llama-3.1-8b-instant"                   # free, fast, great JSON output
-DB_PATH      = os.environ.get("DB_PATH", "careerpath.db")
+# Primary: Groq (fastest, free)
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "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")
+GROQ_MODEL      = "llama-3.1-8b-instant"
+
+# Fallback 1: Google Gemini (generous free tier — 15 RPM, 1000 RPD)
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")   # get free key at https://aistudio.google.com/apikey
+GEMINI_MODEL    = "gemini-2.0-flash"
+
+# Fallback 2: OpenRouter (25+ free models — 20 RPM, 50 RPD free)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")  # get free key at https://openrouter.ai/keys
+OPENROUTER_MODEL   = "meta-llama/llama-3.1-8b-instruct:free"
+
+DB_PATH = os.environ.get("DB_PATH", "careerpath.db")
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 def get_db():
@@ -92,46 +107,148 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── GROQ CLIENT ────────────────────────────────────────────────────────────────
-def groq_generate(prompt: str, system: str = "", temperature: float = 0.3) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError(
-            "Groq API key not set. Get free key at https://console.groq.com "
-            "then run: set GROQ_API_KEY=gsk_..."
-        )
+# ── MULTI-PROVIDER AI CLIENT ───────────────────────────────────────────────────
+# Tries Groq first → falls back to Gemini → falls back to OpenRouter
+# Automatically retries on rate limit (429) errors.
+
+def _call_groq(messages: list, temperature: float) -> str:
+    """Call Groq API (OpenAI-compatible endpoint)."""
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={"model": GROQ_MODEL, "messages": messages, "temperature": temperature, "max_tokens": 4096},
+        timeout=60,
+    )
+    if not resp.ok:
+        print(f"[Groq] Error {resp.status_code}: {resp.text[:200]}")
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+def _call_gemini(messages: list, temperature: float) -> str:
+    """Call Google Gemini API."""
+    # Convert OpenAI-style messages to Gemini format
+    contents = []
+    system_text = ""
+    for m in messages:
+        if m["role"] == "system":
+            system_text = m["content"]
+        elif m["role"] == "user":
+            contents.append({"role": "user", "parts": [{"text": m["content"]}]})
+        elif m["role"] == "assistant":
+            contents.append({"role": "model", "parts": [{"text": m["content"]}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": 4096},
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=60,
+    )
+    if not resp.ok:
+        print(f"[Gemini] Error {resp.status_code}: {resp.text[:200]}")
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+def _call_openrouter(messages: list, temperature: float) -> str:
+    """Call OpenRouter API (OpenAI-compatible endpoint)."""
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5000",
+            "X-Title": "CareerPath AI",
+        },
+        json={"model": OPENROUTER_MODEL, "messages": messages, "temperature": temperature, "max_tokens": 4096},
+        timeout=60,
+    )
+    if not resp.ok:
+        print(f"[OpenRouter] Error {resp.status_code}: {resp.text[:200]}")
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+def ai_generate(prompt: str, system: str = "", temperature: float = 0.3) -> str:
+    """
+    Smart AI caller with automatic fallback:
+      1. Groq (fastest)  — falls back on 429 rate limit
+      2. Gemini          — falls back on 429 rate limit
+      3. OpenRouter      — last resort
+    """
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": GROQ_MODEL, "messages": messages, "temperature": temperature, "max_tokens": 4096},
-            timeout=60,
-        )
-        if not resp.ok:
-            print("GROQ ERROR BODY:", resp.text)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError("Cannot reach Groq API. Check your internet connection.")
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Groq API timed out. Please try again.")
-    except requests.exceptions.HTTPError:
-        if resp.status_code == 401:
-            raise RuntimeError("Invalid Groq API key. Check console.groq.com")
-        if resp.status_code == 429:
-            raise RuntimeError("Groq rate limit hit. Wait 60 seconds and try again.")
-        if resp.status_code == 400:
-            raise RuntimeError(f"Groq bad request: {resp.text}")
-        raise RuntimeError(f"Groq API HTTP error: {resp.status_code} — {resp.text}")
-    except Exception as e:
-        raise RuntimeError(f"Groq error: {e}")
 
-def groq_json(prompt: str, system: str = "") -> dict | list:
-    raw     = groq_generate(prompt, system, temperature=0.2)
-    print("GROQ RAW:", raw[:500])
+    providers = []
+
+    if GROQ_API_KEY:
+        providers.append(("Groq", _call_groq))
+    if GEMINI_API_KEY:
+        providers.append(("Gemini", _call_gemini))
+    if OPENROUTER_API_KEY:
+        providers.append(("OpenRouter", _call_openrouter))
+
+    if not providers:
+        raise RuntimeError(
+            "No AI API key configured. Set at least one of:\n"
+            "  GROQ_API_KEY       → https://console.groq.com\n"
+            "  GEMINI_API_KEY     → https://aistudio.google.com/apikey\n"
+            "  OPENROUTER_API_KEY → https://openrouter.ai/keys"
+        )
+
+    last_error = None
+    for name, caller in providers:
+        try:
+            print(f"[AI] Trying {name}...")
+            result = caller(messages, temperature)
+            print(f"[AI] {name} responded successfully.")
+            return result
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status == 429:
+                print(f"[AI] {name} rate limit hit — trying next provider...")
+                last_error = f"{name} rate limit hit (429)"
+                time.sleep(1)   # brief pause before next provider
+                continue
+            elif status == 401:
+                print(f"[AI] {name} invalid API key — trying next provider...")
+                last_error = f"{name} invalid API key (401)"
+                continue
+            else:
+                print(f"[AI] {name} HTTP error {status} — trying next provider...")
+                last_error = f"{name} HTTP error {status}"
+                continue
+        except requests.exceptions.ConnectionError:
+            print(f"[AI] {name} connection error — trying next provider...")
+            last_error = f"{name} connection error"
+            continue
+        except requests.exceptions.Timeout:
+            print(f"[AI] {name} timed out — trying next provider...")
+            last_error = f"{name} timed out"
+            continue
+        except Exception as e:
+            print(f"[AI] {name} unexpected error: {e} — trying next provider...")
+            last_error = str(e)
+            continue
+
+    raise RuntimeError(
+        f"All AI providers failed. Last error: {last_error}\n"
+        "Tips:\n"
+        "  • Add a Gemini key (free, 15 RPM): https://aistudio.google.com/apikey\n"
+        "  • Add an OpenRouter key (free): https://openrouter.ai/keys\n"
+        "  • Wait 60 seconds and retry (Groq rate limit resets per minute)"
+    )
+
+def ai_json(prompt: str, system: str = "") -> dict | list:
+    """Call AI and parse the response as JSON, with robust cleanup."""
+    raw = ai_generate(prompt, system, temperature=0.2)
+    print("AI RAW:", raw[:500])
 
     # Strip markdown fences
     cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -161,15 +278,16 @@ def groq_json(prompt: str, system: str = "") -> dict | list:
             except json.JSONDecodeError as e:
                 raise ValueError(f"Could not parse JSON: {e}")
 
-    raise ValueError(f"No JSON found in Groq response: {raw[:300]}")
+    raise ValueError(f"No JSON found in AI response: {raw[:300]}")
 # ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 @app.route("/api/health")
 def health():
-    return jsonify({
-        "flask": "ok",
-        "groq":  "configured" if GROQ_API_KEY else "missing API key",
-        "model": GROQ_MODEL,
-    })
+    providers = {}
+    if GROQ_API_KEY:       providers["groq"]        = f"configured ({GROQ_MODEL})"
+    if GEMINI_API_KEY:     providers["gemini"]      = f"configured ({GEMINI_MODEL})"
+    if OPENROUTER_API_KEY: providers["openrouter"]  = f"configured ({OPENROUTER_MODEL})"
+    if not providers:      providers["warning"]     = "No AI API key set!"
+    return jsonify({"flask": "ok", "ai_providers": providers})
 
 # ── REGISTER ──────────────────────────────────────────────────────────────────
 @app.route("/api/register", methods=["POST"])
@@ -257,9 +375,9 @@ Rules:
 
 JSON array:"""
     try:
-        questions = groq_json(prompt, system_prompt)
+        questions = ai_json(prompt, system_prompt)
         if not isinstance(questions, list) or len(questions) == 0:
-            raise ValueError("Invalid response from Groq.")
+            raise ValueError("Invalid response from AI.")
         questions = questions[:20]
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -297,8 +415,8 @@ def generate_roadmap():
 Return ONLY a JSON array with exactly {n} objects:
 [{{"week":1,"title":"Title","topics":[{{"name":"Topic","description":"2 sentences.","practice_task":"Task.","project_idea":"Idea.","resources":[{{"title":"Name","url":"https://example.com","type":"article"}}]}}]}}]"""
     try:
-        weeks_4 = groq_json(build_prompt(4), system_prompt)
-        weeks_8 = groq_json(build_prompt(8), system_prompt)
+        weeks_4 = ai_json(build_prompt(4), system_prompt)
+        weeks_8 = ai_json(build_prompt(8), system_prompt)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     with get_db() as db:
@@ -332,9 +450,9 @@ def generate_progress_questions():
 Level completed: {level}. Return ONLY a JSON array:
 [{{"q":"Question?","tag":"{skills}","difficulty":"medium","options":["A. a","B. b","C. c","D. d"],"answer":0,"explanation":"Reason."}}]"""
     try:
-        questions = groq_json(prompt, system_prompt)
+        questions = ai_json(prompt, system_prompt)
         if not isinstance(questions, list):
-            raise ValueError("Invalid response from Groq.")
+            raise ValueError("Invalid response from AI.")
         questions = questions[:50]
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -383,7 +501,7 @@ Roadmap: {roadmap_summary or 'Not completed'}
 Return ONLY this JSON:
 {{"summary":"3-sentence ATS summary","skills":["s1","s2"],"education":[{{"degree":"...","institution":"...","year":"..."}}],"projects":[{{"title":"...","tech_stack":"...","description":"2 sentences."}}],"achievements":["a1","a2"],"certifications":["c1"]}}"""
     try:
-        resume_data = groq_json(prompt, system_prompt)
+        resume_data = ai_json(prompt, system_prompt)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     resume_data.update({"name": user["name"], "email": user["email"], "phone": user["phone"],
@@ -419,12 +537,21 @@ def index():
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
-    if not GROQ_API_KEY:
-        print("⚠️  WARNING: GROQ_API_KEY not set!")
-        print("   Get your free key at: https://console.groq.com")
-        print("   Then set it: set GROQ_API_KEY=gsk_your_key_here")
+    print("── AI Provider Status ──────────────────────────")
+    if GROQ_API_KEY:
+        print(f"✅ Groq        : {GROQ_API_KEY[:12]}...  (primary)")
     else:
-        print(f"✅ Groq API key loaded ({GROQ_API_KEY[:8]}...)")
-    print(f"🚀 CareerPath AI running at http://localhost:5000")
-    print(f"🤖 Groq model: {GROQ_MODEL}")
+        print("⚠️  Groq        : NOT SET  → https://console.groq.com")
+    if GEMINI_API_KEY:
+        print(f"✅ Gemini      : {GEMINI_API_KEY[:12]}...  (fallback 1)")
+    else:
+        print("⚠️  Gemini      : NOT SET  → https://aistudio.google.com/apikey")
+    if OPENROUTER_API_KEY:
+        print(f"✅ OpenRouter  : {OPENROUTER_API_KEY[:12]}...  (fallback 2)")
+    else:
+        print("⚠️  OpenRouter  : NOT SET  → https://openrouter.ai/keys")
+    if not any([GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY]):
+        print("❌ No API keys set! App will not work.")
+    print("────────────────────────────────────────────────")
+    print("🚀 CareerPath AI running at http://localhost:5000")
     app.run(debug=True, port=5000)
